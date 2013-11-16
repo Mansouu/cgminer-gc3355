@@ -4702,6 +4702,30 @@ void zero_stats(void)
 	}
 }
 
+static void set_highprio(void)
+{
+#ifndef WIN32
+	int ret = nice(-10);
+
+	if (!ret)
+		applog(LOG_DEBUG, "Unable to set thread to high priority");
+#else
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+static void set_lowprio(void)
+{
+#ifndef WIN32
+	int ret = nice(10);
+
+	if (!ret)
+		applog(LOG_INFO, "Unable to set thread to low priority");
+#else
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+}
+
 #ifdef HAVE_CURSES
 static void display_pools(void)
 {
@@ -5111,6 +5135,7 @@ static void *api_thread(void *userdata)
 
 	RenameThread("api");
 
+	set_lowprio();
 	api(api_thr_id);
 
 	PTH(mythr) = 0L;
@@ -6777,6 +6802,7 @@ void *miner_thread(void *userdata)
 	applog(LOG_DEBUG, "Waiting on sem in miner thread");
 	cgsem_wait(&mythr->sem);
 
+	set_highprio();
 	drv->hash_work(mythr);
 out:
 	drv->thread_shutdown(mythr);
@@ -7055,6 +7081,8 @@ static void *watchpool_thread(void __maybe_unused *userdata)
 
 	RenameThread("watchpool");
 
+	set_lowprio();
+
 	while (42) {
 		struct timeval now;
 		int i;
@@ -7138,6 +7166,7 @@ static void *watchdog_thread(void __maybe_unused *userdata)
 
 	RenameThread("watchdog");
 
+	set_lowprio();
 	memset(&zero_tv, 0, sizeof(struct timeval));
 	cgtime(&rotate_tv);
 
