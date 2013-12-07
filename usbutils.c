@@ -3604,6 +3604,7 @@ fila:
 	free(sem);
 	free(key);
 	remove_in_use(bus_number, device_address);
+	unlink(name);
 	return;
 #endif
 }
