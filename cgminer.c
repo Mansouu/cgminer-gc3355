@@ -5164,6 +5164,7 @@ retry:
 	wlogprint("[D]isable device\n");
 	wlogprint("[U]nplug to allow hotplug restart\n");
 	wlogprint("[R]eset device USB\n");
+	wlogprint("[L]ist all known devices\n");
 	//wlogprint("[B]lacklist device from cgminer\n");
 	wlogprint("Select an option or any other key to return\n");
 	logwin_update();
@@ -5251,6 +5252,9 @@ retry:
 			goto retry;
 		}
 		usb_reset(cgpu);
+		goto retry;
+	} else if (!strncasecmp(&input, "l", 1)) {
+		usb_all(0);
 		goto retry;
 	} else
 		clear_logwin();
