@@ -1192,6 +1192,8 @@ static bool __is_in_use(uint8_t bus_number, uint8_t device_address)
 			break;
 		}
 		in_use_tmp = in_use_tmp->next;
+		if (in_use_tmp == in_use_head)
+			break;
 	}
 	in_use_tmp = blacklist_head;
 	while (in_use_tmp) {
@@ -1201,6 +1203,8 @@ static bool __is_in_use(uint8_t bus_number, uint8_t device_address)
 			break;
 		}
 		in_use_tmp = in_use_tmp->next;
+		if (in_use_tmp == blacklist_head)
+			break;
 	}
 
 	return ret;
