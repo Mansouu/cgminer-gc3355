@@ -8137,13 +8137,15 @@ int main(int argc, char *argv[])
 
 	if (unlikely(pthread_cond_init(&gws_cond, NULL)))
 		quit(1, "Failed to pthread_cond_init gws_cond");
-
+		
 	/* Create a unique get work queue */
 	getq = tq_new();
 	if (!getq)
 		quit(1, "Failed to create getq");
 	/* We use the getq mutex as the staged lock */
 	stgd_lock = &getq->mutex;
+
+	initialise_usb();
 
 	snprintf(packagename, sizeof(packagename), "%s %s", PACKAGE, VERSION);
 
