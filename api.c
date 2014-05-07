@@ -800,6 +800,7 @@ static void io_free()
 		do {
 			io_next = io_list->next;
 
+			free(io_list->io_data->ptr);
 			free(io_list->io_data);
 			free(io_list);
 
@@ -1193,7 +1194,7 @@ static struct api_data *print_data(struct api_data *root, char *buf, bool isjson
 			case API_UTILITY:
 			case API_FREQ:
 			case API_MHS:
-				sprintf(buf, "%.2f", *((double *)(root->data)));
+				sprintf(buf, "%.4f", *((double *)(root->data)));
 				break;
 			case API_VOLTS:
 				sprintf(buf, "%.3f", *((float *)(root->data)));
@@ -1715,9 +1716,13 @@ uint64_t api_trylock(void *lock, const char *file, const char *func, const int l
 	LOCKINFO *info;
 	uint64_t id;
 
+	locklock();
+
 	info = findlock(lock, CGLOCK_UNKNOWN, file, func, linenum);
 	id = lock_id++;
 	addgettry(info, id, file, func, linenum, false);
+
+	lockunlock();
 
 	return id;
 }
@@ -4810,7 +4815,7 @@ static void mcast()
 
 		count++;
 		came_from_siz = sizeof(came_from);
-		if (SOCKETFAIL(rep = recvfrom(mcast_sock, buf, sizeof(buf),
+		if (SOCKETFAIL(rep = recvfrom(mcast_sock, buf, sizeof(buf) - 1,
 						0, (struct sockaddr *)(&came_from), &came_from_siz))) {
 			applog(LOG_DEBUG, "API mcast failed count=%d (%s) (%d)",
 					count, SOCKERRMSG, (int)mcast_sock);
@@ -4914,12 +4919,12 @@ void api(int api_thr_id)
 	struct sockaddr_in cli;
 	socklen_t clisiz;
 	char cmdbuf[100];
-	char *cmd;
+	char *cmd = NULL;
 	char *param;
 	bool addrok;
 	char group;
 	json_error_t json_err;
-	json_t *json_config;
+	json_t *json_config = NULL;
 	json_t *json_val;
 	bool isjson;
 	bool did;
@@ -4932,6 +4937,7 @@ void api(int api_thr_id)
 
 	if (!opt_api_listen) {
 		applog(LOG_DEBUG, "API not running%s", UNAVAILABLE);
+		free(apisock);
 		return;
 	}
 
@@ -4949,6 +4955,7 @@ void api(int api_thr_id)
 
 		if (ips == 0) {
 			applog(LOG_WARNING, "API not running (no valid IPs specified)%s", UNAVAILABLE);
+			free(apisock);
 			return;
 		}
 	}
@@ -4960,6 +4967,7 @@ void api(int api_thr_id)
 	*apisock = socket(AF_INET, SOCK_STREAM, 0);
 	if (*apisock == INVSOCK) {
 		applog(LOG_ERR, "API1 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
+		free(apisock);
 		return;
 	}
 
@@ -4971,6 +4979,7 @@ void api(int api_thr_id)
 		serv.sin_addr.s_addr = inet_addr(localaddr);
 		if (serv.sin_addr.s_addr == (in_addr_t)INVINETADDR) {
 			applog(LOG_ERR, "API2 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
+			free(apisock);
 			return;
 		}
 	}
@@ -5009,12 +5018,14 @@ void api(int api_thr_id)
 
 	if (bound == 0) {
 		applog(LOG_ERR, "API bind to port %d failed (%s)%s", port, binderror, UNAVAILABLE);
+		free(apisock);
 		return;
 	}
 
 	if (SOCKETFAIL(listen(*apisock, QUEUE))) {
 		applog(LOG_ERR, "API3 initialisation failed (%s)%s", SOCKERRMSG, UNAVAILABLE);
 		CLOSESOCKET(*apisock);
+		free(apisock);
 		return;
 	}
 
@@ -5088,21 +5099,18 @@ void api(int api_thr_id)
 						message(io_data, MSG_INVJSON, 0, NULL, isjson);
 						send_result(io_data, c, isjson);
 						did = true;
-					}
-					else {
+					} else {
 						json_val = json_object_get(json_config, JSON_COMMAND);
 						if (json_val == NULL) {
 							message(io_data, MSG_MISCMD, 0, NULL, isjson);
 							send_result(io_data, c, isjson);
 							did = true;
-						}
-						else {
+						} else {
 							if (!json_is_string(json_val)) {
 								message(io_data, MSG_INVCMD, 0, NULL, isjson);
 								send_result(io_data, c, isjson);
 								did = true;
-							}
-							else {
+							} else {
 								cmd = (char *)json_string_value(json_val);
 								json_val = json_object_get(json_config, JSON_PARAMETER);
 								if (json_is_string(json_val))
@@ -5119,7 +5127,7 @@ void api(int api_thr_id)
 					}
 				}
 
-				if (!did)
+				if (!did) {
 					for (i = 0; cmds[i].name != NULL; i++) {
 						if (strcmp(cmd, cmds[i].name) == 0) {
 							sprintf(cmdbuf, "|%s|", cmd);
@@ -5135,11 +5143,14 @@ void api(int api_thr_id)
 							break;
 						}
 					}
+				}
 
 				if (!did) {
 					message(io_data, MSG_INVCMD, 0, NULL, isjson);
 					send_result(io_data, c, isjson);
 				}
+				if (isjson && json_is_object(json_config))
+					json_decref(json_config);
 			}
 		}
 		CLOSESOCKET(c);
@@ -5151,6 +5162,8 @@ die:
 	;
 	pthread_cleanup_pop(true);
 
+	free(apisock);
+	
 	if (opt_debug)
 		applog(LOG_DEBUG, "API: terminating due to: %s",
 				do_a_quit ? "QUIT" : (do_a_restart ? "RESTART" : (bye ? "BYE" : "UNKNOWN!")));

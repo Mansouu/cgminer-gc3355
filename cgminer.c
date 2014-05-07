@@ -200,7 +200,6 @@ bool opt_bfl_noncerange;
 struct thr_info *control_thr;
 struct thr_info **mining_thr;
 static int gwsched_thr_id;
-static int stage_thr_id;
 static int watchpool_thr_id;
 static int watchdog_thr_id;
 #ifdef HAVE_CURSES
@@ -1910,13 +1909,15 @@ static void gen_gbt_work(struct pool *pool, struct work *work)
 {
 	unsigned char *merkleroot;
 	struct timeval now;
+	uint64_t nonce2le;
 
 	cgtime(&now);
 	if (now.tv_sec - pool->tv_lastwork.tv_sec > 60)
 		update_gbt(pool);
 
 	cg_wlock(&pool->gbt_lock);
-	memcpy(pool->coinbase + pool->nonce2_offset, &pool->nonce2, 4);
+	nonce2le = htole64(pool->nonce2);
+	memcpy(pool->coinbase + pool->nonce2_offset, &nonce2le, pool->n2size);
 	pool->nonce2++;
 	cg_dwlock(&pool->gbt_lock);
 	merkleroot = __gbt_merkleroot(pool);
@@ -2015,8 +2016,9 @@ static bool gbt_decode(struct pool *pool, json_t *res_val)
 	free(pool->coinbasetxn);
 	pool->coinbasetxn = strdup(coinbasetxn);
 	cbt_len = strlen(pool->coinbasetxn) / 2;
-	pool->coinbase_len = cbt_len + 4;
-	/* We add 4 bytes of extra data corresponding to nonce2 of stratum */
+	/* We add 8 bytes of extra data corresponding to nonce2 */
+	pool->n2size = 8;
+	pool->coinbase_len = cbt_len + pool->n2size;
 	cal_len = pool->coinbase_len + 1;
 	align_len(&cal_len);
 	free(pool->coinbase);
@@ -2027,7 +2029,7 @@ static bool gbt_decode(struct pool *pool, json_t *res_val)
 	extra_len = (uint8_t *)(pool->coinbase + 41);
 	orig_len = *extra_len;
 	hex2bin(pool->coinbase + 42, pool->coinbasetxn + 84, orig_len);
-	*extra_len += 4;
+	*extra_len += pool->n2size;
 	hex2bin(pool->coinbase + 42 + *extra_len, pool->coinbasetxn + 84 + (orig_len * 2),
 		cbt_len - orig_len - 42);
 	pool->nonce2_offset = orig_len + 42;
@@ -2632,7 +2634,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 				       hashshow, cgpu->drv->name, cgpu->device_id, resubmit ? "(resubmit)" : "", worktime);
 		}
 		sharelog("accept", work);
-		if (opt_shares && total_accepted >= opt_shares) {
+		if (opt_shares && total_diff_accepted >= opt_shares) {
 			applog(LOG_WARNING, "Successfully mined %d accepted shares as requested and exiting.", opt_shares);
 			kill_work();
 			return;
@@ -2723,25 +2725,6 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 	}
 }
 
-#ifdef HAVE_LIBCURL
-static void text_print_status(int thr_id)
-{
-	struct cgpu_info *cgpu;
-	char logline[256];
-
-	cgpu = get_thr_cgpu(thr_id);
-	if (cgpu) {
-		get_statline(logline, sizeof(logline), cgpu);
-		printf("%s\n", logline);
-	}
-}
-
-static void print_status(int thr_id)
-{
-	if (!curses_active)
-		text_print_status(thr_id);
-}
-
 static void show_hash(struct work *work, char *hashshow)
 {
 	unsigned char rhash[32];
@@ -2761,6 +2744,25 @@ static void show_hash(struct work *work, char *hashshow)
 	suffix_string(work->share_diff, diffdisp, sizeof (diffdisp), 0);
 	snprintf(hashshow, 64, "%08lx Diff %s/%d%s", h32, diffdisp, intdiff,
 		 work->block? " BLOCK!" : "");
+}
+
+#ifdef HAVE_LIBCURL
+static void text_print_status(int thr_id)
+{
+	struct cgpu_info *cgpu;
+	char logline[256];
+
+	cgpu = get_thr_cgpu(thr_id);
+	if (cgpu) {
+		get_statline(logline, sizeof(logline), cgpu);
+		printf("%s\n", logline);
+	}
+}
+
+static void print_status(int thr_id)
+{
+	if (!curses_active)
+		text_print_status(thr_id);
 }
 
 static bool submit_upstream_work(struct work *work, CURL *curl, bool resubmit)
@@ -3322,11 +3324,7 @@ static void __kill_work(void)
 
 	cg_completion_timeout(&kill_mining, NULL, 3000);
 
-	forcelog(LOG_DEBUG, "Killing off stage thread");
 	/* Stop the others */
-	thr = &control_thr[stage_thr_id];
-	kill_timeout(thr);
-
 	forcelog(LOG_DEBUG, "Killing off API thread");
 	thr = &control_thr[api_thr_id];
 	kill_timeout(thr);
@@ -3683,6 +3681,17 @@ static void _copy_work(struct work *work, const struct work *base_work, int noff
 		work->coinbase = strdup(base_work->coinbase);
 }
 
+void set_work_ntime(struct work *work, int ntime)
+{
+	uint32_t *work_ntime = (uint32_t *)(work->data + 68);
+
+	*work_ntime = htobe32(ntime);
+	if (work->ntime) {
+		free(work->ntime);
+		work->ntime = bin2hex((unsigned char *)work_ntime, 4);
+	}
+}
+
 /* Generates a copy of an existing work struct, creating fresh heap allocations
  * for all dynamically allocated arrays within the struct. noffset is used for
  * when a driver has internally rolled the ntime, noffset is a relative value.
@@ -4015,11 +4024,13 @@ int restart_wait(struct thr_info *thr, unsigned int mstime)
 	
 static void flush_queue(struct cgpu_info *cgpu);
 
-static void restart_threads(void)
+static void *restart_thread(void __maybe_unused *arg)
 {
 	struct pool *cp = current_pool();
 	struct cgpu_info *cgpu;
-	int i;
+	int i, mt;
+
+	pthread_detach(pthread_self());
 
 	/* Artificially set the lagging flag to avoid pool not providing work
 	 * fast enough  messages after every long poll */
@@ -4029,15 +4040,19 @@ static void restart_threads(void)
 	discard_stale();
 
 	rd_lock(&mining_thr_lock);
-	for (i = 0; i < mining_threads; i++) {
+	mt = mining_threads;
+	rd_unlock(&mining_thr_lock);
+
+	for (i = 0; i < mt; i++) {
 		cgpu = mining_thr[i]->cgpu;
 		if (unlikely(!cgpu))
+			continue;
+		if (cgpu->deven != DEV_ENABLED)
 			continue;
 		mining_thr[i]->work_restart = true;
 		flush_queue(cgpu);
 		cgpu->drv->flush_work(cgpu);
 	}
-	rd_unlock(&mining_thr_lock);
 
 	mutex_lock(&restart_lock);
 	pthread_cond_broadcast(&restart_cond);
@@ -4049,6 +4064,18 @@ static void restart_threads(void)
 	 * early. */
 	cancel_usb_transfers();
 #endif
+
+	return NULL;
+}
+
+/* In order to prevent a deadlock via the various drv->flush_work
+ * implementations we send the restart messages via a separate thread. */
+static void restart_threads(void)
+{
+	pthread_t rthread;
+
+	if (unlikely(pthread_create(&rthread, NULL, restart_thread, NULL)))
+		quit(1, "Failed to create restart thread");
 }
 
 static void signal_work_update(void)
@@ -4267,42 +4294,6 @@ static bool hash_push(struct work *work)
 	mutex_unlock(stgd_lock);
 
 	return rc;
-}
-
-static void *stage_thread(void *userdata)
-{
-	struct thr_info *mythr = userdata;
-	bool ok = true;
-
-	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-
-	RenameThread("stage");
-
-	while (ok) {
-		struct work *work = NULL;
-
-		applog(LOG_DEBUG, "Popping work to stage thread");
-
-		work = tq_pop(mythr->q, NULL);
-		if (unlikely(!work)) {
-			applog(LOG_ERR, "Failed to tq_pop in stage_thread");
-			ok = false;
-			break;
-		}
-		work->work_block = work_block;
-
-		test_work_current(work);
-
-		applog(LOG_DEBUG, "Pushing work to getwork queue");
-
-		if (unlikely(!hash_push(work))) {
-			applog(LOG_WARNING, "Failed to hash_push in stage_thread");
-			continue;
-		}
-	}
-
-	tq_freeze(mythr->q);
-	return NULL;
 }
 
 static void stage_work(struct work *work)
@@ -4728,6 +4719,30 @@ void zero_stats(void)
 	}
 }
 
+static void set_highprio(void)
+{
+#ifndef WIN32
+	int ret = nice(-10);
+
+	if (!ret)
+		applog(LOG_DEBUG, "Unable to set thread to high priority");
+#else
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+static void set_lowprio(void)
+{
+#ifndef WIN32
+	int ret = nice(10);
+
+	if (!ret)
+		applog(LOG_INFO, "Unable to set thread to low priority");
+#else
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+}
+
 #ifdef HAVE_CURSES
 static void display_pools(void)
 {
@@ -5137,6 +5152,7 @@ static void *api_thread(void *userdata)
 
 	RenameThread("api");
 
+	set_lowprio();
 	api(api_thr_id);
 
 	PTH(mythr) = 0L;
@@ -5246,7 +5262,7 @@ static void hashmeter(int thr_id, struct timeval *diff,
 
 	local_secs = (double)total_diff.tv_sec + ((double)total_diff.tv_usec / 1000000.0);
 	decay_time(&total_rolling, local_mhashes_done / local_secs, local_secs);
-	global_hashrate = llround(total_rolling) * 1000000;
+	global_hashrate = ((unsigned long long)lround(total_rolling)) * 1000000;
 
 	timersub(&total_tv_end, &total_tv_start, &total_diff);
 	total_secs = (double)total_diff.tv_sec +
@@ -5588,8 +5604,7 @@ static void *stratum_rthread(void *userdata)
 
 		if (!parse_method(pool, s) && !parse_stratum_response(pool, s))
 			applog(LOG_INFO, "Unknown stratum msg: %s", s);
-		free(s);
-		if (pool->swork.clean) {
+		else if (pool->swork.clean) {
 			struct work *work = make_work();
 
 			/* Generate a single work item to update the current
@@ -5602,6 +5617,7 @@ static void *stratum_rthread(void *userdata)
 			test_work_current(work);
 			free_work(work);
 		}
+		free(s);
 	}
 
 out:
@@ -5626,10 +5642,11 @@ static void *stratum_sthread(void *userdata)
 		quit(1, "Failed to create stratum_q in stratum_sthread");
 
 	while (42) {
-		char noncehex[12], nonce2hex[20];
+		char noncehex[12], nonce2hex[20], s[1024];
 		struct stratum_share *sshare;
 		uint32_t *hash32, nonce;
-		char s[1024], nonce2[8];
+		unsigned char nonce2[8];
+		uint64_t *nonce2_64;
 		struct work *work;
 		bool submitted;
 
@@ -5664,10 +5681,9 @@ static void *stratum_sthread(void *userdata)
 		sshare->id = swork_id++;
 		mutex_unlock(&sshare_lock);
 
-		memset(nonce2, 0, 8);
-		/* We only use uint32_t sized nonce2 increments internally */
-		memcpy(nonce2, &work->nonce2, sizeof(uint32_t));
-		__bin2hex(nonce2hex, (const unsigned char *)nonce2, work->nonce2_len);
+		nonce2_64 = (uint64_t *)nonce2;
+		*nonce2_64 = htole64(work->nonce2);
+		__bin2hex(nonce2hex, nonce2, work->nonce2_len);
 
 		snprintf(s, sizeof(s),
 			"{\"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\": %d, \"method\": \"mining.submit\"}",
@@ -5799,7 +5815,7 @@ retry_stratum:
 	}
 
 	/* Probe for GBT support on first pass */
-	if (!pool->probed && !opt_fix_protocol) {
+	if (!pool->probed) {
 		applog(LOG_DEBUG, "Probing for GBT support");
 		val = json_rpc_call(curl, pool->rpc_url, pool->rpc_userpass,
 				    gbt_req, true, false, &rolltime, pool, false);
@@ -5878,7 +5894,7 @@ retry_stratum:
 			calc_diff(work, 0);
 			applog(LOG_DEBUG, "Pushing pooltest work to base pool");
 
-			tq_push(control_thr[stage_thr_id].q, work);
+			stage_work(work);
 			total_getworks++;
 			pool->getwork_requested++;
 			ret = true;
@@ -6073,12 +6089,15 @@ static void gen_stratum_work(struct pool *pool, struct work *work)
 {
 	unsigned char merkle_root[32], merkle_sha[64];
 	uint32_t *data32, *swap32;
+	uint64_t nonce2le;
 	int i;
 
 	cg_wlock(&pool->data_lock);
 
-	/* Update coinbase */
-	memcpy(pool->coinbase + pool->nonce2_offset, &pool->nonce2, sizeof(uint32_t));
+	/* Update coinbase. Always use an LE encoded nonce2 to fill in values
+	 * from left to right and prevent overflow errors with small n2sizes */
+	nonce2le = htole64(pool->nonce2);
+	memcpy(pool->coinbase + pool->nonce2_offset, &nonce2le, pool->n2size);
 	work->nonce2 = pool->nonce2++;
 	work->nonce2_len = pool->n2size;
 
@@ -6118,7 +6137,8 @@ static void gen_stratum_work(struct pool *pool, struct work *work)
 		merkle_hash = bin2hex((const unsigned char *)merkle_root, 32);
 		applog(LOG_DEBUG, "Generated stratum merkle %s", merkle_hash);
 		applog(LOG_DEBUG, "Generated stratum header %s", header);
-		applog(LOG_DEBUG, "Work job_id %s nonce2 %d ntime %s", work->job_id, work->nonce2, work->ntime);
+		applog(LOG_DEBUG, "Work job_id %s nonce2 %"PRIu64" ntime %s", work->job_id,
+		       work->nonce2, work->ntime);
 		free(header);
 		free(merkle_hash);
 	}
@@ -6632,6 +6652,30 @@ void __work_completed(struct cgpu_info *cgpu, struct work *work)
 	cgpu->queued_count--;
 	HASH_DEL(cgpu->queued_work, work);
 }
+
+/* This iterates over a queued hashlist finding work started more than secs
+ * seconds ago and discards the work as completed. The driver must set the
+ * work->tv_work_start value appropriately. Returns the number of items aged. */
+int age_queued_work(struct cgpu_info *cgpu, double secs)
+{
+	struct work *work, *tmp;
+	struct timeval tv_now;
+	int aged = 0;
+
+	cgtime(&tv_now);
+
+	wr_lock(&cgpu->qlock);
+	HASH_ITER(hh, cgpu->queued_work, work, tmp) {
+		if (tdiff(&tv_now, &work->tv_work_start) > secs) {
+			__work_completed(cgpu, work);
+			aged++;
+		}
+	}
+	wr_unlock(&cgpu->qlock);
+
+	return aged;
+}
+
 /* This function should be used by queued device drivers when they're sure
  * the work struct is no longer in use. */
 void work_completed(struct cgpu_info *cgpu, struct work *work)
@@ -6695,17 +6739,21 @@ void hash_queued_work(struct thr_info *mythr)
 		struct timeval diff;
 		int64_t hashes;
 
-		mythr->work_restart = mythr->work_update = false;
+		mythr->work_update = false;
 
 		fill_queue(mythr, cgpu, drv, thr_id);
 
 		hashes = drv->scanwork(mythr);
 
+		/* Reset the bool here in case the driver looks for it
+		 * synchronously in the scanwork loop. */
+		mythr->work_restart = false;
+
 		if (unlikely(hashes == -1 )) {
 			applog(LOG_ERR, "%s %d failure, disabling!", drv->name, cgpu->device_id);
 			cgpu->deven = DEV_DISABLED;
 			dev_error(cgpu, REASON_THREAD_ZERO_HASH);
-			mt_disable(mythr, thr_id, drv);
+			break;
 		}
 
 		hashes_done += hashes;
@@ -6744,15 +6792,19 @@ void hash_driver_work(struct thr_info *mythr)
 		struct timeval diff;
 		int64_t hashes;
 
-		mythr->work_restart = mythr->work_update = false;
+		mythr->work_update = false;
 
 		hashes = drv->scanwork(mythr);
+
+		/* Reset the bool here in case the driver looks for it
+		 * synchronously in the scanwork loop. */
+		mythr->work_restart = false;
 
 		if (unlikely(hashes == -1 )) {
 			applog(LOG_ERR, "%s %d failure, disabling!", drv->name, cgpu->device_id);
 			cgpu->deven = DEV_DISABLED;
 			dev_error(cgpu, REASON_THREAD_ZERO_HASH);
-			mt_disable(mythr, thr_id, drv);
+			break;
 		}
 
 		hashes_done += hashes;
@@ -6795,6 +6847,7 @@ void *miner_thread(void *userdata)
 	applog(LOG_DEBUG, "Waiting on sem in miner thread");
 	cgsem_wait(&mythr->sem);
 
+	set_highprio();
 	drv->hash_work(mythr);
 out:
 	drv->thread_shutdown(mythr);
@@ -7073,6 +7126,8 @@ static void *watchpool_thread(void __maybe_unused *userdata)
 
 	RenameThread("watchpool");
 
+	set_lowprio();
+
 	while (42) {
 		struct timeval now;
 		int i;
@@ -7114,11 +7169,11 @@ static void *watchpool_thread(void __maybe_unused *userdata)
 			}
 
 			/* Only switch pools if the failback pool has been
-			 * alive for more than 5 minutes to prevent
+			 * alive for more than one minute to prevent
 			 * intermittently failing pools from being used. */
 			if (!pool->idle && pool_strategy == POOL_FAILOVER && pool->prio < cp_prio() &&
-			    now.tv_sec - pool->tv_idle.tv_sec > 300) {
-				applog(LOG_WARNING, "Pool %d %s stable for 5 mins",
+			    now.tv_sec - pool->tv_idle.tv_sec > 60) {
+				applog(LOG_WARNING, "Pool %d %s stable for 1 minute",
 				       pool->pool_no, pool->rpc_url);
 				switch_pools(NULL);
 			}
@@ -7156,6 +7211,7 @@ static void *watchdog_thread(void __maybe_unused *userdata)
 
 	RenameThread("watchdog");
 
+	set_lowprio();
 	memset(&zero_tv, 0, sizeof(struct timeval));
 	cgtime(&rotate_tv);
 
@@ -7406,9 +7462,9 @@ void print_summary(void)
 	}
 
 	if (opt_shares) {
-		applog(LOG_WARNING, "Mined %d accepted shares of %d requested\n", total_accepted, opt_shares);
-		if (opt_shares > total_accepted)
-			applog(LOG_WARNING, "WARNING - Mined only %d shares of %d requested.", total_accepted, opt_shares);
+		applog(LOG_WARNING, "Mined %.0f accepted shares of %d requested\n", total_diff_accepted, opt_shares);
+		if (opt_shares > total_diff_accepted)
+			applog(LOG_WARNING, "WARNING - Mined only %.0f shares of %d requested.", total_diff_accepted, opt_shares);
 	}
 	applog(LOG_WARNING, " ");
 
@@ -8081,6 +8137,13 @@ int main(int argc, char *argv[])
 
 	if (unlikely(pthread_cond_init(&gws_cond, NULL)))
 		quit(1, "Failed to pthread_cond_init gws_cond");
+		
+	/* Create a unique get work queue */
+	getq = tq_new();
+	if (!getq)
+		quit(1, "Failed to create getq");
+	/* We use the getq mutex as the staged lock */
+	stgd_lock = &getq->mutex;
 
 	initialise_usb();
 
@@ -8189,7 +8252,7 @@ int main(int argc, char *argv[])
 	if (opt_scantime < 0)
 		opt_scantime = opt_scrypt ? 30 : 60;
 
-	total_control_threads = 9;
+	total_control_threads = 8;
 	control_thr = calloc(total_control_threads, sizeof(*thr));
 	if (!control_thr)
 		quit(1, "Failed to calloc control_thr");
@@ -8324,22 +8387,36 @@ int main(int argc, char *argv[])
 			quit(1, "Failed to calloc mining_thr[%d]", i);
 	}
 
-	stage_thr_id = 2;
-	thr = &control_thr[stage_thr_id];
-	thr->q = tq_new();
-	if (!thr->q)
-		quit(1, "Failed to tq_new");
-	/* start stage thread */
-	if (thr_info_create(thr, NULL, stage_thread, thr))
-		quit(1, "stage thread create failed");
-	pthread_detach(thr->pth);
+	// Start threads
+	k = 0;
+	for (i = 0; i < total_devices; ++i) {
+		struct cgpu_info *cgpu = devices[i];
+		cgpu->thr = malloc(sizeof(*cgpu->thr) * (cgpu->threads+1));
+		cgpu->thr[cgpu->threads] = NULL;
+		cgpu->status = LIFE_INIT;
 
-	/* Create a unique get work queue */
-	getq = tq_new();
-	if (!getq)
-		quit(1, "Failed to create getq");
-	/* We use the getq mutex as the staged lock */
-	stgd_lock = &getq->mutex;
+		for (j = 0; j < cgpu->threads; ++j, ++k) {
+			thr = get_thread(k);
+			thr->id = k;
+			thr->cgpu = cgpu;
+			thr->device_thread = j;
+
+			if (!cgpu->drv->thread_prepare(thr))
+				continue;
+
+			if (unlikely(thr_info_create(thr, NULL, miner_thread, thr)))
+				quit(1, "thread %d create failed", thr->id);
+
+			cgpu->thr[j] = thr;
+
+			/* Enable threads for devices set not to mine but disable
+			 * their queue in case we wish to enable them later */
+			if (cgpu->deven != DEV_DISABLED) {
+				applog(LOG_DEBUG, "Pushing sem post to thread %d", thr->id);
+				cgsem_post(&thr->sem);
+			}
+		}
+	}
 
 	if (opt_benchmark)
 		goto begin_bench;
@@ -8398,36 +8475,6 @@ begin_bench:
 	cgtime(&total_tv_end);
 	get_datestamp(datestamp, sizeof(datestamp), &total_tv_start);
 
-	// Start threads
-	k = 0;
-	for (i = 0; i < total_devices; ++i) {
-		struct cgpu_info *cgpu = devices[i];
-		cgpu->thr = malloc(sizeof(*cgpu->thr) * (cgpu->threads+1));
-		cgpu->thr[cgpu->threads] = NULL;
-		cgpu->status = LIFE_INIT;
-
-		for (j = 0; j < cgpu->threads; ++j, ++k) {
-			thr = get_thread(k);
-			thr->id = k;
-			thr->cgpu = cgpu;
-			thr->device_thread = j;
-
-			if (!cgpu->drv->thread_prepare(thr))
-				continue;
-
-			if (unlikely(thr_info_create(thr, NULL, miner_thread, thr)))
-				quit(1, "thread %d create failed", thr->id);
-
-			cgpu->thr[j] = thr;
-
-			/* Enable threads for devices set not to mine but disable
-			 * their queue in case we wish to enable them later */
-			if (cgpu->deven != DEV_DISABLED) {
-				applog(LOG_DEBUG, "Pushing sem post to thread %d", thr->id);
-				cgsem_post(&thr->sem);
-			}
-		}
-	}
 
 #ifdef HAVE_OPENCL
 	applog(LOG_INFO, "%d gpu miner threads started", gpu_threads);
@@ -8438,14 +8485,14 @@ begin_bench:
 	cgtime(&total_tv_start);
 	cgtime(&total_tv_end);
 
-	watchpool_thr_id = 3;
+	watchpool_thr_id = 2;
 	thr = &control_thr[watchpool_thr_id];
 	/* start watchpool thread */
 	if (thr_info_create(thr, NULL, watchpool_thread, NULL))
 		quit(1, "watchpool thread create failed");
 	pthread_detach(thr->pth);
 
-	watchdog_thr_id = 4;
+	watchdog_thr_id = 3;
 	thr = &control_thr[watchdog_thr_id];
 	/* start watchdog thread */
 	if (thr_info_create(thr, NULL, watchdog_thread, NULL))
@@ -8454,7 +8501,7 @@ begin_bench:
 
 #ifdef HAVE_OPENCL
 	/* Create reinit gpu thread */
-	gpur_thr_id = 5;
+	gpur_thr_id = 4;
 	thr = &control_thr[gpur_thr_id];
 	thr->q = tq_new();
 	if (!thr->q)
@@ -8464,7 +8511,7 @@ begin_bench:
 #endif	
 
 	/* Create API socket thread */
-	api_thr_id = 6;
+	api_thr_id = 5;
 	thr = &control_thr[api_thr_id];
 	if (thr_info_create(thr, NULL, api_thread, thr))
 		quit(1, "API thread create failed");
@@ -8481,7 +8528,7 @@ begin_bench:
 	/* Create curses input thread for keyboard input. Create this last so
 	 * that we know all threads are created since this can call kill_work
 	 * to try and shut down all previous threads. */
-	input_thr_id = 8;
+	input_thr_id = 7;
 	thr = &control_thr[input_thr_id];
 	if (thr_info_create(thr, NULL, input_thread, thr))
 		quit(1, "input thread create failed");
@@ -8489,8 +8536,8 @@ begin_bench:
 #endif
 
 	/* Just to be sure */
-	if (total_control_threads != 9)
-		quit(1, "incorrect total_control_threads (%d) should be 9", total_control_threads);
+	if (total_control_threads != 8)
+		quit(1, "incorrect total_control_threads (%d) should be 8", total_control_threads);
 
 	/* Once everything is set up, main() becomes the getwork scheduler */
 	while (42) {
