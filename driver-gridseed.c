@@ -542,7 +542,7 @@ static void gridseed_initialise(struct cgpu_info *gridseed, GRIDSEED_INFO *info)
 		return;
 }
 
-static bool gridseed_detect_one(libusb_device *dev, struct usb_find_devices *found)
+static struct cgpu_info *gridseed_detect_one(libusb_device *dev, struct usb_find_devices *found)
 {
 	struct cgpu_info *gridseed;
 	GRIDSEED_INFO *info;
@@ -615,7 +615,7 @@ static bool gridseed_detect_one(libusb_device *dev, struct usb_find_devices *fou
 	if (!add_cgpu(gridseed))
 		goto unshin;
 
-	return true;
+	return gridseed;
 
 unshin:
 	usb_uninit(gridseed);
@@ -624,7 +624,7 @@ unshin:
 
 shin:
 	gridseed = usb_free_cgpu(gridseed);
-	return false;
+	return NULL;
 }
 
 static bool gridseed_send_task(struct cgpu_info *gridseed, struct work *work)
