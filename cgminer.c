@@ -8517,7 +8517,7 @@ begin_bench:
 		quit(1, "API thread create failed");
 
 #ifdef USE_USBUTILS
-	hotplug_thr_id = 7;
+	hotplug_thr_id = 6;
 	thr = &control_thr[hotplug_thr_id];
 	if (thr_info_create(thr, NULL, hotplug_thread, thr))
 		quit(1, "hotplug thread create failed");
