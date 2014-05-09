@@ -4,9 +4,9 @@ ACLOCAL_AMFLAGS = -I m4
 JANSSON_CPPFLAGS = -I$(top_builddir)/compat/jansson-2.5/src -I$(top_srcdir)/compat/jansson-2.5/src
 
 if WANT_USBUTILS
-USBUTILS_INCLUDES = -I$(top_builddir)/compat/libusb-1.0/libusb -I$(top_srcdir)/compat/libusb-1.0/libusb
+USBUTILS_CPPFLAGS = -I$(top_builddir)/compat/libusb-1.0/libusb -I$(top_srcdir)/compat/libusb-1.0/libusb
 else
-USBUTILS_INCLUDES =
+USBUTILS_CPPFLAGS =
 endif
 
 EXTRA_DIST	= example.conf m4/gnulib-cache.m4 linux-usb-cgminer \
@@ -18,7 +18,7 @@ EXTRA_DIST	= example.conf m4/gnulib-cache.m4 linux-usb-cgminer \
 
 SUBDIRS		= lib compat ccan
 
-INCLUDES	= $(PTHREAD_FLAGS) -fno-strict-aliasing $(JANSSON_CPPFLAGS) $(USBUTILS_INCLUDES)
+cgminer_CPPFLAGS = $(PTHREAD_FLAGS) -fno-strict-aliasing $(JANSSON_CPPFLAGS) $(USBUTILS_CPPFLAGS)
 
 bin_PROGRAMS	= cgminer
 
