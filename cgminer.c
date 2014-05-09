@@ -8505,9 +8505,6 @@ begin_bench:
 		pause_dynamic_threads(i);
 #endif
 
-	cgtime(&total_tv_start);
-	cgtime(&total_tv_end);
-
 	watchpool_thr_id = 2;
 	thr = &control_thr[watchpool_thr_id];
 	/* start watchpool thread */
