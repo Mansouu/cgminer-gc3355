@@ -2345,8 +2345,13 @@ static void curses_print_status(void)
 		     prev_block, block_diff, blocktime, best_share);
 	mvwhline(statuswin, 6, 0, '-', 90);
 	mvwhline(statuswin, statusy - 1, 0, '-', 90);
+#ifdef USE_USBUTILS
+	cg_mvwprintw(statuswin, devcursor - 1, 1, "[U]SB device management [P]ool management [S]ettings [D]isplay options [Q]uit",
+		have_opencl ? "[G]PU management " : "");
+#else
 	cg_mvwprintw(statuswin, devcursor - 1, 1, "[P]ool management %s[S]ettings [D]isplay options [Q]uit",
 		have_opencl ? "[G]PU management " : "");
+#endif
 }
 
 static void adj_width(int var, int *length)
@@ -2363,7 +2368,7 @@ static void adj_fwidth(float var, int *length)
 
 static int dev_width;
 
-static void curses_print_devstatus(struct cgpu_info *cgpu, int count)
+static void curses_print_devstatus(struct cgpu_info *cgpu, int devno, int count)
 {
 	static int dawidth = 1, drwidth = 1, hwwidth = 1, wuwidth = 1;
 	char logline[256];
@@ -2395,7 +2400,7 @@ static void curses_print_devstatus(struct cgpu_info *cgpu, int count)
 	wu = cgpu->diff1 / dev_runtime * 60;
 
 	wmove(statuswin,devcursor + count, 0);
-	cg_wprintw(statuswin, " %s %*d: ", cgpu->drv->name, dev_width, cgpu->device_id);
+	cg_wprintw(statuswin, " %03d: %s %*d: ", devno, cgpu->drv->name, dev_width, cgpu->device_id);
 	logline[0] = '\0';
 	cgpu->drv->get_statline_before(logline, sizeof(logline), cgpu);
 	cg_wprintw(statuswin, "%s", logline);
@@ -5116,6 +5121,88 @@ retry:
 	opt_loginput = false;
 }
 
+#ifdef USE_USBUTILS
+static void set_usb(void)
+{
+	int selected, i, mt, enabled = 0, disabled = 0, zombie = 0, total = 0;
+	struct cgpu_info *cgpu;
+	double val;
+	char input;
+
+	opt_loginput = true;
+	immedok(logwin, true);
+	clear_logwin();
+
+	rd_lock(&mining_thr_lock);
+	mt = mining_threads;
+	rd_unlock(&mining_thr_lock);
+
+	for (i = 0; i < mt; i++) {
+		cgpu = mining_thr[i]->cgpu;
+		if (unlikely(!cgpu))
+			continue;
+		if (cgpu->usbinfo.nodev)
+			zombie++;
+		else if  (cgpu->deven == DEV_DISABLED)
+			disabled++;
+		else
+			enabled++;
+		total++;
+	}
+	wlogprint("Hotplug interval:%d\n", hotplug_time);
+	wlogprint("%d USB devices, %d enabled, %d disabled, %d zombie\n",
+		  total, enabled, disabled, zombie);
+retry:
+	wlogprint("[S]ummary of device information\n");
+	//wlogprint("[D]etailed device statistics\n");
+	//wlogprint("[E]nable device\n");
+	//wlogprint("[D]isable device\n");
+	//wlogprint("[U]nplug to allow hotplug restart\n");
+	//wlogprint("[R]elease device from cgminer\n");
+	wlogprint("Select an option or any other key to return\n");
+	logwin_update();
+	input = getch();
+
+	if (!strncasecmp(&input, "s", 1)) {
+		selected = curses_int("Select device number");
+		if (selected < 0 || selected >= mt)  {
+			wlogprint("Invalid selection\n");
+			goto retry;
+		}
+		cgpu = mining_thr[selected]->cgpu;
+		wlogprint("Name %s\n", cgpu->drv->name);
+		wlogprint("ID %d\n", cgpu->device_id);
+		wlogprint("Enabled: %s\n", cgpu->deven != DEV_DISABLED ? "Yes" : "No");
+		wlogprint("Temperature %.1f\n", cgpu->temp);
+		wlogprint("MHS av %.0f\n", cgpu->total_mhashes / cgpu_runtime(cgpu));
+		wlogprint("Accepted %d\n", cgpu->accepted);
+		wlogprint("Rejected %d\n", cgpu->rejected);
+		wlogprint("Hardware Errors %d\n", cgpu->hw_errors);
+		wlogprint("Last Share Pool %d\n", cgpu->last_share_pool_time > 0 ? cgpu->last_share_pool : -1);
+		wlogprint("Total MH %.1f\n", cgpu->total_mhashes);
+		wlogprint("Diff1 Work %d\n", cgpu->diff1);
+		wlogprint("Difficulty Accepted %.1f\n", cgpu->diff_accepted);
+		wlogprint("Difficulty Rejected %.1f\n", cgpu->diff_rejected);
+		wlogprint("Last Share Difficulty %.1f\n", cgpu->last_share_diff);
+		wlogprint("No Device: %s\n", cgpu->usbinfo.nodev ? "True" : "False");
+		wlogprint("Last Valid Work %"PRIu64"\n", (uint64_t)cgpu->last_device_valid_work);
+		val = 0;
+		if (cgpu->hw_errors + cgpu->diff1)
+			val = cgpu->hw_errors / (cgpu->hw_errors + cgpu->diff1);
+		wlogprint("Device Hardware %.1f%%\n", val);
+		val = 0;
+		if (cgpu->diff1)
+			val = cgpu->diff_rejected / cgpu->diff1;
+		wlogprint("Device Rejected %.1f%%\n", val);
+		goto retry;
+	} else
+		clear_logwin();
+
+	immedok(logwin, false);
+	opt_loginput = false;
+}
+#endif
+
 static void *input_thread(void __maybe_unused *userdata)
 {
 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
@@ -5141,6 +5228,10 @@ static void *input_thread(void __maybe_unused *userdata)
 #if HAVE_OPENCL
 		else if (have_opencl && !strncasecmp(&input, "g", 1))
 			manage_gpu();
+#endif
+#ifdef USE_USBUTILS
+		else if (!strncasecmp(&input, "u", 1))
+			set_usb();
 #endif
 		if (opt_realquiet) {
 			disable_curses();
@@ -7324,13 +7415,13 @@ static void *watchdog_thread(void __maybe_unused *userdata)
 #else
 				if (cgpu && !cgpu->usbinfo.nodev)
 #endif
-					curses_print_devstatus(cgpu, count++);
+					curses_print_devstatus(cgpu, i, count++);
 			}
 #ifdef USE_USBUTILS
 			for (i = 0; i < total_devices; i++) {
 				cgpu = get_devices(i);
 				if (cgpu && cgpu->usbinfo.nodev)
-					curses_print_devstatus(cgpu, count++);
+					curses_print_devstatus(cgpu, i, count++);
 			}
 #endif
 			touchwin(statuswin);
