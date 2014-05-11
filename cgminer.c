@@ -2375,7 +2375,7 @@ static void curses_print_status(void)
 	mvwhline(statuswin, 6, 0, '-', 98);
 	mvwhline(statuswin, statusy - 1, 0, '-', 98);
 #ifdef USE_USBUTILS
-	cg_mvwprintw(statuswin, devcursor - 1, 1, "[U]SB device management [P]ool management [S]ettings [D]isplay options [Q]uit",
+	cg_mvwprintw(statuswin, devcursor - 1, 1, "[U]SB device management %s[P]ool management [S]ettings [D]isplay options [Q]uit",
 		have_opencl ? "[G]PU management " : "");
 #else
 	cg_mvwprintw(statuswin, devcursor - 1, 1, "[P]ool management %s[S]ettings [D]isplay options [Q]uit",
